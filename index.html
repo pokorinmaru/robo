@@ -1,1 +1,844 @@
 
+import pandas as pd
+import webbrowser
+import os
+import json
+import datetime
+
+# データ読み込み
+df = pd.read_excel(r'C:\Python\物件\マスタ管理\map.xlsx')
+
+# 総戸数_数値、徒歩列を数値型に変換（数値に変換できないものは NaN に変換）
+df['総戸数_数値'] = pd.to_numeric(df['総戸数_数値'], errors='coerce')
+df['坪単価_数値'] = pd.to_numeric(df['坪単価_数値'], errors='coerce')
+df['徒歩'] = pd.to_numeric(df['徒歩'], errors='coerce')
+
+# '竣工時期'列をyyyymmdd形式から日付に変換し、ISO 8601形式で文字列に変換
+df['竣工時期'] = pd.to_datetime(df['竣工時期'], format='%Y%m%d', errors='coerce')
+
+# 今日の日付を取得
+today = pd.to_datetime(datetime.date.today())
+
+# ステータスに基づく背景色と文字色を決定する関数
+def get_label_style(status):
+    if status == 'お知らせ看板':
+        return 'yellow', 'black'
+    elif status == '販売中':
+        return 'blue', 'white'
+    elif status == '販売予定':
+        return 'red', 'white'
+    elif status == '完売':
+        return 'gray', 'white'
+    else:
+        return 'blue', 'white'  # デフォルトの色
+
+# データをJSON形式に変換
+data = []
+for i, r in df.iterrows():
+    bg_color, text_color = get_label_style(r['ステータス'])
+    data.append({
+        'id': i,
+        'name': r['物件名'],
+        'lat': r['緯度'],
+        'lng': r['経度'],
+        'status': r['ステータス'],
+        'bgColor': bg_color,
+        'textColor': text_color,
+        'address': r['住所'],
+        '坪単価_数値': r['坪単価_数値'] if not pd.isnull(r['坪単価_数値']) else None,
+        '総戸数_数値': r['総戸数_数値'] if not pd.isnull(r['総戸数_数値']) else None,
+        '徒歩': r['徒歩'] if not pd.isnull(r['徒歩']) else None,
+        '竣工時期': r['竣工時期'].isoformat() if pd.notnull(r['竣工時期']) else None,
+        '小エリア': r['小エリア']
+    })
+
+# 小エリアのリストを取得
+small_areas = df['小エリア'].dropna().unique()
+
+# HTMLテンプレート
+html_content = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>にゃんころ</title>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <!-- Leaflet CSSとJavaScript -->
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.7.1/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet@1.7.1/dist/leaflet.js"></script>
+    <!-- カスタムスタイル -->
+    <style>
+        body { margin: 0; padding: 0; }
+        #map { position: absolute; top: 0; bottom: 0; width: 100%; }
+        .custom-div-icon { text-align: center; }
+        .label-text { 
+            white-space: nowrap; 
+            display: inline-block; 
+            padding: 5px; 
+            border-radius: 3px; 
+            font-size: 8px;
+            overflow: visible;
+        }
+        .leaflet-control {
+            background: white;
+            padding: 10px;
+            border-radius: 5px;
+            box-shadow: 0 0 10px rgba(0,0,0,0.2);
+        }
+        .leaflet-bar {
+            padding: 10px;
+        }
+        details summary {
+            font-weight: bold;
+            cursor: pointer;
+        }
+        details[open] summary {
+            color: #007bff;
+        }
+        details {
+            margin-bottom: 10px;
+        }
+        /* フィルタウィンドウのスタイル */
+        #filter-window {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            z-index: 1000;
+        }
+        /* フィルタトグルボタンのスタイル */
+        #toggle-filter-btn {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            z-index: 1100;
+            background: white;
+            border: none;
+            padding: 5px 10px;
+            cursor: pointer;
+            box-shadow: 0 0 5px rgba(0,0,0,0.5);
+            border-radius: 5px;
+        }
+        /* 中心の赤十字のスタイル */
+        .center-cross {
+            position: absolute;
+            pointer-events: none;
+            z-index: 1000;
+            width: 0;
+            height: 0;
+        }
+        
+        /* 印刷時のスタイル */
+        @media print {
+            body {
+                width: 100%;
+                height: 100%;
+                margin: 0;
+                padding: 0;
+            }
+            #map {
+                width: 100%;
+                height: 100%;
+                page-break-inside: avoid;
+            }
+            @page {
+                size: auto;
+                margin: 0mm;
+                scale: 80%;
+            }
+            /* 印刷時に不要な要素を非表示にする */
+            #filter-window, #toggle-filter-btn, #center-button, 
+            #arrange-labels-btn, #adjust-labels-btn, #align-labels-btn {
+                display: none !important;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div id="map"></div>
+    <div id="center-cross"></div>
+    <button id="center-button" style="position: absolute; bottom: 10px; left: 10px; z-index: 1000;">中心に</button>
+    <!-- ラベル配置ボタン -->
+    <button id="arrange-labels-btn" style="position: absolute; bottom: 50px; left: 10px; z-index: 1000;">ラベルを配置</button>
+    <!-- ラベルの重なりを調整するボタン -->
+    <button id="adjust-labels-btn" style="position: absolute; bottom: 90px; left: 10px; z-index: 1000;">ラベルの重なりを調整</button>
+    <!-- ラベルを両端に配置するボタン -->
+    <button id="align-labels-btn" style="position: absolute; bottom: 130px; left: 10px; z-index: 1000;">ラベルを両端に配置</button>
+    <!-- フィルタトグルボタン -->
+    <button id="toggle-filter-btn">フィルタ表示/非表示</button>
+    <div id="filter-window">
+        <script>
+            var data = {json_data};
+            var map = L.map('map', {
+                zoomSnap: 0.1,
+                zoomDelta: 0.1
+            }).setView([data[0].lat, data[0].lng], 15);
+
+            L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+                attribution: '&copy; OpenStreetMap contributors'
+            }).addTo(map);
+
+            var markers = {};
+            var labels = {};
+            var lines = {};
+            var overlays = {
+                'お知らせ看板': L.layerGroup().addTo(map),
+                '販売中': L.layerGroup().addTo(map),
+                '販売予定': L.layerGroup().addTo(map),
+                '完売': L.layerGroup().addTo(map)
+            };
+
+            // マーカーと中心点からラベルを配置する関数
+            function arrangeLabelsRadially() {
+                var center = map.getCenter();
+                var mapSize = map.getSize(); // マップのピクセルサイズを取得
+                var pixelBounds = map.getPixelBounds(); // マップのピクセル座標での表示範囲を取得
+            
+                var visibleLabels = [];
+            
+                for (var key in labels) {
+                    if (map.hasLayer(labels[key])) {
+                        visibleLabels.push(labels[key]);
+                    }
+                }
+            
+                visibleLabels.forEach(function(label) {
+                    var markerId = label.options.markerId;
+                    var marker = markers[markerId];
+                    var markerPos = marker.getLatLng();
+            
+                    // 中心からマーカーへのベクトルを計算
+                    var deltaLat = markerPos.lat - center.lat;
+                    var deltaLng = markerPos.lng - center.lng;
+            
+                    // マーカーからラベルへのベクトルを計算（中心からマーカーへのベクトルを2倍する）
+                    var newLat = markerPos.lat + deltaLat;
+                    var newLng = markerPos.lng + deltaLng;
+                    var newLatLng = L.latLng(newLat, newLng);
+            
+                    // ラベルのピクセル位置を取得
+                    var labelPoint = map.latLngToContainerPoint(newLatLng);
+            
+                    // ラベルのサイズを取得
+                    var iconSize = label.options.icon.options.iconSize;
+                    var labelWidth = iconSize[0];
+                    var labelHeight = iconSize[1];
+            
+                    // ラベルの四隅のピクセル位置を計算
+                    var labelLeft = labelPoint.x - labelWidth / 2;
+                    var labelRight = labelPoint.x + labelWidth / 2;
+                    var labelTop = labelPoint.y - labelHeight / 2;
+                    var labelBottom = labelPoint.y + labelHeight / 2;
+            
+                    var adjusted = false;
+            
+                    // ラベルがマップの左端を越える場合
+                    if (labelLeft < 0) {
+                        labelPoint.x += -labelLeft;
+                        adjusted = true;
+                    }
+            
+                    // ラベルがマップの右端を越える場合
+                    if (labelRight > mapSize.x) {
+                        labelPoint.x -= labelRight - mapSize.x;
+                        adjusted = true;
+                    }
+            
+                    // ラベルがマップの上端を越える場合
+                    if (labelTop < 0) {
+                        labelPoint.y += -labelTop;
+                        adjusted = true;
+                    }
+            
+                    // ラベルがマップの下端を越える場合
+                    if (labelBottom > mapSize.y) {
+                        labelPoint.y -= labelBottom - mapSize.y;
+                        adjusted = true;
+                    }
+            
+                    if (adjusted) {
+                        // 調整後のピクセル位置を緯度経度に変換
+                        newLatLng = map.containerPointToLatLng(labelPoint);
+                    }
+            
+                    // ラベルの位置を更新
+                    label.setLatLng(newLatLng);
+            
+                    // 引出線を更新
+                    var line = lines[markerId];
+                    line.setLatLngs([marker.getLatLng(), newLatLng]);
+                });
+            }
+
+            // マーカーが右側か左側かでラベルを画面端に寄せる
+            function alignLabelsToEdges() {
+    var mapSize = map.getSize();
+    var mapCenter = map.getCenter();
+    var mapCenterPoint = map.latLngToContainerPoint(mapCenter);
+
+    for (var key in labels) {
+        if (map.hasLayer(labels[key])) {
+            var label = labels[key];
+            var marker = markers[key];
+            var markerPos = marker.getLatLng();
+            var markerPoint = map.latLngToContainerPoint(markerPos);
+
+            // マーカーが画面の中心より右か左かを判定
+            var alignToRight = markerPoint.x >= mapCenterPoint.x;
+
+            // ラベルのY座標はマーカーと同じ
+            var labelY = markerPoint.y;
+
+            // ラベルの幅を取得
+            var iconSize = label.options.icon.options.iconSize;
+            var labelWidth = iconSize[0];
+            var labelHeight = iconSize[1];
+
+            // ラベルのX座標を決定
+            var margin = 300; // 画面端からのマージン
+            var labelX = alignToRight ? (mapSize.x - margin - (labelWidth / 2)) : (margin + (labelWidth / 2));
+
+            // ラベルのアンカー位置を設定（ラベルの中心を基準にする）
+            label.options.icon.options.iconAnchor = [labelWidth / 2, labelHeight / 2];
+
+            // ラベルのテキスト配置を設定
+            var labelDiv = label.getElement().querySelector('.label-text');
+            if (alignToRight) {
+                labelDiv.style.textAlign = 'right';
+            } else {
+                labelDiv.style.textAlign = 'left';
+            }
+
+            // 新しい位置を設定
+            var newLatLng = map.containerPointToLatLng([labelX, labelY]);
+            label.setLatLng(newLatLng);
+
+            // 引出線を更新
+            var line = lines[key];
+            line.setLatLngs([markerPos, newLatLng]);
+        }
+    }
+}
+
+
+            // イベントリスナーを追加
+            document.getElementById('arrange-labels-btn').addEventListener('click', function() {
+                arrangeLabelsRadially();
+            });
+
+            // "ラベルを両端に配置"ボタンのイベントリスナーを追加
+            document.getElementById('align-labels-btn').addEventListener('click', function() {
+                alignLabelsToEdges();
+            });
+
+            // ラベルの重なりを調整する関数
+            function adjustLabelOverlaps() {
+                var visibleLabels = [];
+                var visibleMarkers = [];
+            
+                // 現在表示されているラベルを収集し、その画面上の位置とサイズを取得
+                for (var key in labels) {
+                    if (map.hasLayer(labels[key])) {
+                        var label = labels[key];
+                        var labelPos = map.latLngToLayerPoint(label.getLatLng());
+                        var iconSize = label.options.icon.options.iconSize;
+                        var width = iconSize[0];
+                        var height = iconSize[1];
+                        visibleLabels.push({
+                            label: label,
+                            x: labelPos.x - width / 2,
+                            y: labelPos.y - height / 2,
+                            width: width,
+                            height: height,
+                            markerId: key
+                        });
+                    }
+                }
+            
+                // 現在表示されているマーカーを収集し、その画面上の位置とサイズを取得
+                for (var key in markers) {
+                    if (map.hasLayer(markers[key])) {
+                        var marker = markers[key];
+                        var markerPos = map.latLngToLayerPoint(marker.getLatLng());
+                        var iconSize = marker.options.icon.options.iconSize;
+                        var width = iconSize[0];
+                        var height = iconSize[1];
+                        visibleMarkers.push({
+                            x: markerPos.x - width / 2,
+                            y: markerPos.y - height / 2,
+                            width: width,
+                            height: height
+                        });
+                    }
+                }
+            
+                // ラベルをY座標でソート（上下方向で重なり解消を処理）
+                visibleLabels.sort(function(a, b) {
+                    return a.y - b.y;
+                });
+            
+                // 重なりを解消する
+                for (var i = 0; i < visibleLabels.length; i++) {
+                    var labelA = visibleLabels[i];
+            
+                    // マーカーとの重なりをチェック
+                    for (var k = 0; k < visibleMarkers.length; k++) {
+                        var marker = visibleMarkers[k];
+                        if (isOverlap(labelA, marker)) {
+                            // 重なっている場合、ランダムに上または下方向にずらす
+                            var overlapHeight = (marker.y + marker.height) - labelA.y;
+                            var direction = (Math.random() > 0.5) ? 1 : -1; // ランダムに上下にずらす
+                            labelA.y += (overlapHeight + 1) * direction;
+            
+                            // ラベルの新しい位置を設定
+                            var newLatLng = map.layerPointToLatLng([labelA.x + labelA.width / 2, labelA.y + labelA.height / 2]);
+                            labelA.label.setLatLng(newLatLng);
+            
+                            // 引出線を更新
+                            var markerRef = markers[labelA.markerId];
+                            var line = lines[labelA.markerId];
+                            line.setLatLngs([markerRef.getLatLng(), newLatLng]);
+            
+                            // 他のマーカーとの重なりを再チェック
+                            k = -1;
+                        }
+                    }
+            
+                    // 他のラベルとの重なりをチェック
+                    for (var j = i + 1; j < visibleLabels.length; j++) {
+                        var labelB = visibleLabels[j];
+            
+                        if (isOverlap(labelA, labelB)) {
+                            // 重なっている場合、下のラベルを上下方向にずらす
+                            var overlapHeight = (labelA.y + labelA.height) - labelB.y;
+                            var direction = (Math.random() > 0.5) ? 1 : -1; // ランダムに上下にずらす
+                            labelB.y += (overlapHeight + 1) * direction;
+            
+                            // ラベルの新しい位置を設定
+                            var newLatLng = map.layerPointToLatLng([labelB.x + labelB.width / 2, labelB.y + labelB.height / 2]);
+                            labelB.label.setLatLng(newLatLng);
+            
+                            // 引出線を更新
+                            var markerRef = markers[labelB.markerId];
+                            var line = lines[labelB.markerId];
+                            line.setLatLngs([markerRef.getLatLng(), newLatLng]);
+            
+                            // 他のラベルとの重なりを再チェック
+                            j = i;
+                        }
+                    }
+                }
+            }
+            
+            // ラベルの重なりを判定する関数
+            function isOverlap(a, b) {
+                return !(a.x + a.width < b.x ||
+                         b.x + b.width < a.x ||
+                         a.y + a.height < b.y ||
+                         b.y + b.height < a.y);
+            }
+
+
+            // 重なり調整ボタンのイベントリスナーを追加
+            document.getElementById('adjust-labels-btn').addEventListener('click', function() {
+                adjustLabelOverlaps();
+            });
+            
+            // イベントリスナーを追加
+            document.getElementById('arrange-labels-btn').addEventListener('click', function() {
+                arrangeLabelsRadially();
+            });
+
+
+
+            function addressMatches(address, keywords) {
+                const addressLower = address.toLowerCase();
+                return keywords.some(keyword => addressLower.includes(keyword));
+            }
+
+            function updateMarkers(minPrice, maxPrice, minUnits, maxUnits, minWalk, maxWalk, keyword) {
+                // 各レイヤーグループをクリア
+                for (var key in overlays) {
+                    overlays[key].clearLayers();
+                }
+
+                // 選択されているステータスを取得
+                var selectedStatuses = Array.from(document.querySelectorAll('.layer-checkbox:checked')).map(cb => cb.getAttribute('data-status'));
+
+                // 小エリアのフィルタリング
+                var selectedAreas = Array.from(document.querySelectorAll('.area-checkbox:checked')).map(cb => cb.getAttribute('data-area'));
+
+                // 坪単価不明を含むかどうかのチェック状態を取得
+                var includeUnknownPrice = document.getElementById('include-unknown-price').checked;
+
+                // バス便含むかどうかのチェック状態を取得
+                var includeBus = document.getElementById('include-bus').checked;
+
+                // 竣工済み物件のみ表示のチェック状態を取得
+                var filterCompleted = document.getElementById('filter-completed').checked;
+
+                // キーワードで住所を部分一致で検索
+                var keywords = keyword.toLowerCase().split(' ').filter(k => k.length > 0);
+
+                data.forEach(function(item) {
+                    var priceIsValid = (item['坪単価_数値'] === null && includeUnknownPrice) || 
+                                       (item['坪単価_数値'] !== null && item['坪単価_数値'] >= minPrice && item['坪単価_数値'] <= maxPrice);
+                    var unitsIsValid = (item['総戸数_数値'] !== null && item['総戸数_数値'] >= minUnits && item['総戸数_数値'] <= maxUnits);
+                    var walkIsValid = (item['徒歩'] === null && includeBus) || 
+                                      (item['徒歩'] !== null && item['徒歩'] >= minWalk && item['徒歩'] <= maxWalk);
+                    var addressMatched = keywords.length === 0 || addressMatches(item['address'], keywords);
+                    var areaIsValid = selectedAreas.includes(item['小エリア']);
+
+                    // 竣工済みかどうかの判定
+                    var isCompleted = false;
+                    if (item['竣工時期']) {
+                        var completionDate = new Date(item['竣工時期']);
+                        if (!isNaN(completionDate.getTime())) {
+                            isCompleted = completionDate.getTime() <= new Date().getTime();
+                        }
+                    }
+
+                    if (priceIsValid && unitsIsValid && walkIsValid && addressMatched && areaIsValid && selectedStatuses.includes(item.status)) {
+                        if (filterCompleted && !isCompleted) {
+                            return; // 竣工済み物件のみを表示する場合、竣工していない物件はスキップ
+                        }
+                        // マーカー作成
+                        var marker = L.marker([item.lat, item.lng], {
+                            icon: L.divIcon({
+                                className: 'custom-div-icon',
+                                html: '<div style="background-color:' + item.bgColor + '; color:' + item.textColor + '; width:15px; height:15px; border-radius:50%; display:flex; align-items:center; justify-content:center; font-weight:bold; font-size:8px;">' + (item.id + 1) + '</div>',
+                                iconSize: [15, 15],  // マーカーサイズを半分にする
+                                iconAnchor: [7.5, 7.5]  // アンカー位置も半分に調整
+                            })
+                        }).bindPopup('<b>' + item.name + '</b><br>住所: ' + item.address);
+
+                        // ラベル内容の定義
+                        var labelContent = (item.id + 1) + ': ' + item.name;
+
+                        // 一時的な div 要素で幅と高さを計測
+                        var tempDiv = document.createElement('div');
+                        tempDiv.style.position = 'absolute';
+                        tempDiv.style.visibility = 'hidden';
+                        tempDiv.style.whiteSpace = 'nowrap';
+                        tempDiv.style.fontSize = '8px';
+                        tempDiv.className = 'label-text';
+                        tempDiv.innerHTML = labelContent;
+                        document.body.appendChild(tempDiv);
+
+                        var labelWidth = tempDiv.offsetWidth;
+                        var labelHeight = tempDiv.offsetHeight;
+
+                        document.body.removeChild(tempDiv);
+
+                        // ラベルを作成
+                        var label = L.marker([item.lat + 0.001, item.lng + 0.001], {
+                            draggable: true,
+                            icon: L.divIcon({
+                                className: 'custom-div-icon',
+                                html: '<div class="label-text" style="background-color:' + item.bgColor + '; color:' + item.textColor + '; width:auto; height:7.5px; padding:2px; font-weight:bold; font-size:9px;">' + labelContent + '</div>',
+
+                                iconSize: [labelWidth, labelHeight],
+                                iconAnchor: [labelWidth / 2, labelHeight / 2]
+                            }),
+                            markerId: item.id
+                        });
+
+                        // 引出線作成
+                        var line = L.polyline([[item.lat, item.lng], [item.lat + 0.001, item.lng + 0.001]], {
+                            color: 'blue',
+                            weight: 2,
+                            opacity: 0.8
+                        });
+
+                        markers[item.id] = marker;
+                        labels[item.id] = label;
+                        lines[item.id] = line;
+
+
+
+        
+
+                        // ドラッグでラベルと引出線の動的更新
+                        label.on('drag', function(e) {
+                            var newPos = e.target.getLatLng();
+                            line.setLatLngs([marker.getLatLng(), newPos]);
+                        });
+
+                        // レイヤーグループに追加
+                        overlays[item.status].addLayer(marker);
+                        overlays[item.status].addLayer(label);
+                        overlays[item.status].addLayer(line);
+                    }
+                });
+
+                // 中心ボタンの機能を更新
+                updateCenterButtonFunctionality();
+            }
+
+            function updateCenterButtonFunctionality() {
+                var centerButton = document.getElementById('center-button');
+                centerButton.onclick = function() {
+                    var visibleMarkers = [];
+                    for (var key in overlays) {
+                        overlays[key].eachLayer(function(layer) {
+                            if (layer instanceof L.Marker) {
+                                visibleMarkers.push(layer.getLatLng());
+                            }
+                        });
+                    }
+
+                    if (visibleMarkers.length > 0) {
+                        var bounds = L.latLngBounds(visibleMarkers);
+                        map.fitBounds(bounds, {padding: [50, 50]});
+                    }
+                };
+            }
+
+            
+
+            // 初期化時に中心ボタンの機能を設定
+            updateCenterButtonFunctionality();
+
+            // カスタムコントロール（フィルタウィンドウ）を作成
+            var controlDiv = L.DomUtil.create('div', 'leaflet-control');
+            controlDiv.innerHTML = `
+                <details>
+                    <summary>小エリアフィルタ</summary>
+                    <label><input type="checkbox" id="select-all-areas" checked> すべて選択</label><br>
+                    <div id="area-filter"></div>
+                </details>
+                <details>
+                    <summary>ステータスフィルタ</summary>
+                    <div id="layer-control"></div>
+                </details>
+                <details>
+                    <summary>その他フィルタ</summary>
+                    <label><input type="checkbox" id="include-unknown-price" checked> 坪単価不明を含む</label><br>
+                    <label><input type="checkbox" id="include-bus"> バス便含む</label><br>
+                    <label><input type="checkbox" id="filter-completed"> 竣工済み物件のみ表示</label>
+                </details>
+                <label for="price-range">坪単価の範囲:</label><br>
+                <input type="range" id="price-range-min" min="{min_price}" max="{max_price}" value="{min_price}">
+                <input type="range" id="price-range-max" min="{min_price}" max="{max_price}" value="{max_price}">
+                <span id="range-value-min">{min_price}</span> - <span id="range-value-max">{max_price}</span><br><br>
+                <label for="units-range">総戸数の範囲:</label><br>
+                <input type="range" id="units-range-min" min="{min_units}" max="{max_units}" value="{min_units}">
+                <input type="range" id="units-range-max" min="{min_units}" max="{max_units}" value="{max_units}">
+                <span id="range-units-min">{min_units}</span> - <span id="range-units-max">{max_units}</span><br><br>
+                <label for="walk-range">徒歩の範囲:</label><br>
+                <input type="range" id="walk-range-min" min="{min_walk}" max="{max_walk}" value="{min_walk}">
+                <input type="range" id="walk-range-max" min="{min_walk}" max="{max_walk}" value="{max_walk}">
+                <span id="range-walk-min">{min_walk}</span> - <span id="range-walk-max">{max_walk}</span><br><br>
+                <label for="keyword-search">住所検索（部分一致）:</label><br>
+                <input type="text" id="keyword-search" placeholder="住所で検索"><br><br>
+                `;
+                // フィルタウィンドウに追加
+                document.getElementById('filter-window').appendChild(controlDiv);
+                
+                // 小エリアフィルタの作成
+                var areaFilter = document.getElementById('area-filter');
+                var areas = {json_small_areas};
+                areas.forEach(function(area) {
+                    var areaDiv = document.createElement('div');
+                    areaDiv.innerHTML = '<label><input type="checkbox" class="area-checkbox" data-area="' + area + '" checked> ' + area + '</label>';
+                    areaFilter.appendChild(areaDiv);
+                });
+                
+                // 「すべて選択」機能の設定
+                var selectAllAreasCheckbox = document.getElementById('select-all-areas');
+                var areaCheckboxes = document.querySelectorAll('.area-checkbox');
+                selectAllAreasCheckbox.addEventListener('change', function() {
+                    areaCheckboxes.forEach(function(checkbox) {
+                        checkbox.checked = selectAllAreasCheckbox.checked;
+                    });
+                    updateMarkers(parseFloat(priceRangeMin.value), parseFloat(priceRangeMax.value), parseFloat(unitsRangeMin.value), parseFloat(unitsRangeMax.value), parseFloat(walkRangeMin.value), parseFloat(walkRangeMax.value), keywordSearch.value);
+                });
+                
+                // レイヤーコントロールの作成
+                var layerControl = document.getElementById('layer-control');
+                var selectAllDiv = document.createElement('div');
+                selectAllDiv.innerHTML = '<label><input type="checkbox" id="select-all" checked /> 全て選択</label>';
+                layerControl.appendChild(selectAllDiv);
+                
+                Object.keys(overlays).forEach(function(layerName) {
+                    var layerDiv = document.createElement('div');
+                    layerDiv.innerHTML = '<label><input type="checkbox" class="layer-checkbox" data-status="' + layerName + '" checked /> ' + layerName + '</label>';
+                    layerControl.appendChild(layerDiv);
+                });
+                
+                var selectAllCheckbox = document.getElementById('select-all');
+                var layerCheckboxes = document.querySelectorAll('.layer-checkbox');
+                
+                selectAllCheckbox.addEventListener('change', function() {
+                    layerCheckboxes.forEach(function(checkbox) {
+                        checkbox.checked = selectAllCheckbox.checked;
+                    });
+                    updateMarkers(parseFloat(priceRangeMin.value), parseFloat(priceRangeMax.value), parseFloat(unitsRangeMin.value), parseFloat(unitsRangeMax.value), parseFloat(walkRangeMin.value), parseFloat(walkRangeMax.value), keywordSearch.value);
+                });
+                
+                layerCheckboxes.forEach(function(checkbox) {
+                    checkbox.addEventListener('change', function() {
+                        var allChecked = Array.from(layerCheckboxes).every(cb => cb.checked);
+                        selectAllCheckbox.checked = allChecked;
+                        updateMarkers(parseFloat(priceRangeMin.value), parseFloat(priceRangeMax.value), parseFloat(unitsRangeMin.value), parseFloat(unitsRangeMax.value), parseFloat(walkRangeMin.value), parseFloat(walkRangeMax.value), keywordSearch.value);
+                    });
+                });
+                
+                // スライダーのイベント設定
+                var priceRangeMin = document.getElementById('price-range-min');
+                var priceRangeMax = document.getElementById('price-range-max');
+                var rangeValueMin = document.getElementById('range-value-min');
+                var rangeValueMax = document.getElementById('range-value-max');
+                
+                priceRangeMin.addEventListener('input', function() {
+                    if (parseFloat(priceRangeMin.value) > parseFloat(priceRangeMax.value)) {
+                        priceRangeMax.value = priceRangeMin.value;
+                        rangeValueMax.innerText = priceRangeMax.value;
+                    }
+                    rangeValueMin.innerText = priceRangeMin.value;
+                    updateMarkers(parseFloat(priceRangeMin.value), parseFloat(priceRangeMax.value), parseFloat(unitsRangeMin.value), parseFloat(unitsRangeMax.value), parseFloat(walkRangeMin.value), parseFloat(walkRangeMax.value), keywordSearch.value);
+                });
+                
+                priceRangeMax.addEventListener('input', function() {
+                    if (parseFloat(priceRangeMax.value) < parseFloat(priceRangeMin.value)) {
+                        priceRangeMin.value = priceRangeMax.value;
+                        rangeValueMin.innerText = priceRangeMin.value;
+                    }
+                    rangeValueMax.innerText = priceRangeMax.value;
+                    updateMarkers(parseFloat(priceRangeMin.value), parseFloat(priceRangeMax.value), parseFloat(unitsRangeMin.value), parseFloat(unitsRangeMax.value), parseFloat(walkRangeMin.value), parseFloat(walkRangeMax.value), keywordSearch.value);
+                });
+                
+                // 総戸数スライダーのイベント設定
+                var unitsRangeMin = document.getElementById('units-range-min');
+                var unitsRangeMax = document.getElementById('units-range-max');
+                var rangeUnitsMin = document.getElementById('range-units-min');
+                var rangeUnitsMax = document.getElementById('range-units-max');
+                
+                unitsRangeMin.addEventListener('input', function() {
+                    if (parseFloat(unitsRangeMin.value) > parseFloat(unitsRangeMax.value)) {
+                        unitsRangeMax.value = unitsRangeMin.value;
+                        rangeUnitsMax.innerText = unitsRangeMax.value;
+                    }
+                    rangeUnitsMin.innerText = unitsRangeMin.value;
+                    updateMarkers(parseFloat(priceRangeMin.value), parseFloat(priceRangeMax.value), parseFloat(unitsRangeMin.value), parseFloat(unitsRangeMax.value), parseFloat(walkRangeMin.value), parseFloat(walkRangeMax.value), keywordSearch.value);
+                });
+                
+                unitsRangeMax.addEventListener('input', function() {
+                    if (parseFloat(unitsRangeMax.value) < parseFloat(unitsRangeMin.value)) {
+                        unitsRangeMin.value = unitsRangeMax.value;
+                        rangeUnitsMin.innerText = unitsRangeMin.value;
+                    }
+                    rangeUnitsMax.innerText = unitsRangeMax.value;
+                    updateMarkers(parseFloat(priceRangeMin.value), parseFloat(priceRangeMax.value), parseFloat(unitsRangeMin.value), parseFloat(unitsRangeMax.value), parseFloat(walkRangeMin.value), parseFloat(walkRangeMax.value), keywordSearch.value);
+                });
+                
+                // 徒歩スライダーのイベント設定
+                var walkRangeMin = document.getElementById('walk-range-min');
+                var walkRangeMax = document.getElementById('walk-range-max');
+                var rangeWalkMin = document.getElementById('range-walk-min');
+                var rangeWalkMax = document.getElementById('range-walk-max');
+                
+                walkRangeMin.addEventListener('input', function() {
+                    if (parseFloat(walkRangeMin.value) > parseFloat(walkRangeMax.value)) {
+                        walkRangeMax.value = walkRangeMin.value;
+                        rangeWalkMax.innerText = walkRangeMax.value;
+                    }
+                    rangeWalkMin.innerText = walkRangeMin.value;
+                    updateMarkers(parseFloat(priceRangeMin.value), parseFloat(priceRangeMax.value), parseFloat(unitsRangeMin.value), parseFloat(unitsRangeMax.value), parseFloat(walkRangeMin.value), parseFloat(walkRangeMax.value), keywordSearch.value);
+                });
+                
+                walkRangeMax.addEventListener('input', function() {
+                    if (parseFloat(walkRangeMax.value) < parseFloat(walkRangeMin.value)) {
+                        walkRangeMin.value = walkRangeMax.value;
+                        rangeWalkMin.innerText = walkRangeMin.value;
+                    }
+                    rangeWalkMax.innerText = walkRangeMax.value;
+                    updateMarkers(parseFloat(priceRangeMin.value), parseFloat(priceRangeMax.value), parseFloat(unitsRangeMin.value), parseFloat(unitsRangeMax.value), parseFloat(walkRangeMin.value), parseFloat(walkRangeMax.value), keywordSearch.value);
+                });
+                
+                // 住所検索のイベント設定
+                var keywordSearch = document.getElementById('keyword-search');
+                keywordSearch.addEventListener('input', function() {
+                    // 全角スペースを半角スペースに変換
+                    var normalizedKeyword = keywordSearch.value.replace(/　/g, ' ');
+                
+                    updateMarkers(parseFloat(priceRangeMin.value), parseFloat(priceRangeMax.value), 
+                                  parseFloat(unitsRangeMin.value), parseFloat(unitsRangeMax.value), 
+                                  parseFloat(walkRangeMin.value), parseFloat(walkRangeMax.value), 
+                                  normalizedKeyword); // 変換されたキーワードを渡す
+                });
+
+                
+                // "坪単価不明を含む"チェックボックスのイベント設定
+                var includeUnknownPriceCheckbox = document.getElementById('include-unknown-price');
+                includeUnknownPriceCheckbox.addEventListener('change', function() {
+                    updateMarkers(parseFloat(priceRangeMin.value), parseFloat(priceRangeMax.value), parseFloat(unitsRangeMin.value), parseFloat(unitsRangeMax.value), parseFloat(walkRangeMin.value), parseFloat(walkRangeMax.value), keywordSearch.value);
+                });
+                
+                // "バス便含む"チェックボックスのイベント設定
+                var includeBusCheckbox = document.getElementById('include-bus');
+                includeBusCheckbox.addEventListener('change', function() {
+                    updateMarkers(parseFloat(priceRangeMin.value), parseFloat(priceRangeMax.value), parseFloat(unitsRangeMin.value), parseFloat(unitsRangeMax.value), parseFloat(walkRangeMin.value), parseFloat(walkRangeMax.value), keywordSearch.value);
+                });
+                
+                // "竣工済み物件のみ表示"チェックボックスのイベント設定
+                var filterCompletedCheckbox = document.getElementById('filter-completed');
+                filterCompletedCheckbox.addEventListener('change', function() {
+                    updateMarkers(parseFloat(priceRangeMin.value), parseFloat(priceRangeMax.value), parseFloat(unitsRangeMin.value), parseFloat(unitsRangeMax.value), parseFloat(walkRangeMin.value), parseFloat(walkRangeMax.value), keywordSearch.value);
+                });
+                
+                // 小エリアフィルタのチェックボックスのイベント設定
+                areaCheckboxes.forEach(function(checkbox) {
+                    checkbox.addEventListener('change', function() {
+                        var allChecked = Array.from(areaCheckboxes).every(cb => cb.checked);
+                        selectAllAreasCheckbox.checked = allChecked;
+                        updateMarkers(parseFloat(priceRangeMin.value), parseFloat(priceRangeMax.value), parseFloat(unitsRangeMin.value), parseFloat(unitsRangeMax.value), parseFloat(walkRangeMin.value), parseFloat(walkRangeMax.value), keywordSearch.value);
+                    });
+                });
+                
+                // 初期表示
+                updateMarkers(parseFloat(priceRangeMin.value), parseFloat(priceRangeMax.value), parseFloat(unitsRangeMin.value), parseFloat(unitsRangeMax.value), parseFloat(walkRangeMin.value), parseFloat(walkRangeMax.value), keywordSearch.value);
+                
+                // フィルタウィンドウの表示・非表示を切り替えるボタンの設定
+                var toggleFilterBtn = document.getElementById('toggle-filter-btn');
+                var filterWindow = document.getElementById('filter-window');
+                toggleFilterBtn.addEventListener('click', function() {
+                    if (filterWindow.style.display === 'none') {
+                        filterWindow.style.display = 'block';
+                    } else {
+                        filterWindow.style.display = 'none';
+                }
+            });
+        </script>
+    </div>
+</body>
+</html>
+"""
+
+# 坪単価、総戸数、徒歩の最小値と最大値を取得
+min_price = int(df['坪単価_数値'].min())
+max_price = int(df['坪単価_数値'].max())
+min_units = int(df['総戸数_数値'].min())
+max_units = int(df['総戸数_数値'].max())
+min_walk = int(df['徒歩'].min())
+max_walk = int(df['徒歩'].max())
+
+# HTMLコンテンツに坪単価、総戸数、徒歩の範囲と小エリアリストを挿入
+html_content = html_content.replace('{min_price}', str(min_price))
+html_content = html_content.replace('{max_price}', str(max_price))
+html_content = html_content.replace('{min_units}', str(min_units))
+html_content = html_content.replace('{max_units}', str(max_units))
+html_content = html_content.replace('{min_walk}', str(min_walk))
+html_content = html_content.replace('{max_walk}', str(max_walk))
+html_content = html_content.replace('{json_data}', json.dumps(data, ensure_ascii=False))
+html_content = html_content.replace('{json_small_areas}', json.dumps(list(small_areas), ensure_ascii=False))
+
+# HTMLファイル保存パス
+html_file_path = r"C:\Python\物件\マスタ管理\dynamic_map_with_controls_on_map.html"
+
+# HTMLファイルを保存
+with open(html_file_path, 'w', encoding='utf-8') as f:
+    f.write(html_content)
+
+# 作成したHTMLをChromeで開く
+chrome_path = 'C:/Program Files/Google/Chrome/Application/chrome.exe %s'  # Chromeのインストールパスを指定
+webbrowser.get(chrome_path).open('file://' + os.path.realpath(html_file_path))
